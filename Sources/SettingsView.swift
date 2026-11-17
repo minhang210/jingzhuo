@@ -82,7 +82,7 @@ struct SettingsView: View {
     @ObservedObject var model: AppModel
 
     private var version: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.6.6"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.7.0"
     }
 
     private func modeButton(_ mode: MinimizeMode) -> some View {
@@ -163,18 +163,6 @@ struct SettingsView: View {
                     Toggle("登录时启动", isOn: Binding(get: { model.loginEnabled || model.loginApprovalNeeded }, set: model.setLogin))
                         .labelsHidden().toggleStyle(.switch).controlSize(.small).disabled(model.busy)
                 }.frame(minHeight: 31)
-                HStack {
-                    Text("在程序坞显示").font(.system(size: 13)); Spacer()
-                    Toggle("在程序坞显示", isOn: Binding(get: { model.showAppDock }, set: model.setShowAppDock))
-                        .labelsHidden().toggleStyle(.switch).controlSize(.small)
-                        .disabled(model.busy || model.barsBusy)
-                }.frame(minHeight: 31)
-                HStack {
-                    Text("是否ESC关闭当前窗口").font(.system(size: 13)); Spacer()
-                    Toggle("是否ESC关闭当前窗口", isOn: Binding(get: { model.escCloseEnabled }, set: model.setEscapeClose))
-                        .labelsHidden().toggleStyle(.switch).controlSize(.small)
-                        .disabled(model.busy || model.barsBusy || model.isRecording)
-                }.frame(minHeight: 31)
             }.padding(.top, 23)
 
             Divider().padding(.top, 16).padding(.bottom, 15)
@@ -225,7 +213,6 @@ struct SettingsView: View {
             Button("知道了", role: .cancel) {}
         } message: { Text(model.message) }
         .onAppear { model.updateLoginStatus() }
-        .onChange(of: model.showErrorAlert) { _ in model.updateEscapeSuspension() }
     }
 
     private var recordingHint: some View {

@@ -22,12 +22,10 @@ final class AppModel: ObservableObject {
     @Published var loginEnabled = false
     @Published var loginApprovalNeeded = false
     @Published var showErrorAlert = false
-    @Published private(set) var escCloseEnabled = false
     @Published var barsShortcut: Shortcut = .barsStandard
     @Published var barsShortcutReady = false
     @Published var barsBusy = false
     @Published private(set) var barTargets = BarTargets()
-    @Published private(set) var showAppDock = UserDefaults.standard.object(forKey: "showAppDock.v1") as? Bool ?? true
     @Published var windowExpanded = UserDefaults.standard.object(forKey: "windowExpanded.v1") as? Bool ?? true {
         didSet { UserDefaults.standard.set(windowExpanded, forKey: "windowExpanded.v1") }
     }
@@ -39,9 +37,17 @@ final class AppModel: ObservableObject {
     var onStateChanged: (() -> Void)?
     private var hotKey: GlobalHotKey?
     private var barsHotKey: GlobalHotKey?
-    private let escapeMonitor = EscapeCloseMonitor()
     private let barsQueue = DispatchQueue(label: "local.jingzhuo.system-bars", qos: .userInitiated)
     private var permissionTimer: Timer?
+    private var recoveryTimer: Timer?
+    private var recoveryBaseline: RecoveryBaseline<AXUIElement>?
+    private var recoveryTargetOffset = 0
+    private var recoveryGeneration = 0
+    private var recoveryChecking = false
+    private var recoveryCheckCancellation: CancellationFlag?
+    private enum RecoveryFollowUp { case toggle, restore }
+    private var recoveryFollowUp: RecoveryFollowUp?
+    private var workspaceObservers: [NSObjectProtocol] = []
     private let queue = DispatchQueue(label: "local.jingzhuo.windows", qos: .userInitiated)
     private var lastBatch = LastWindowBatch<BatchWindow>()
     private var cancellation: CancellationFlag?
@@ -74,39 +80,33 @@ final class AppModel: ObservableObject {
             }
         } catch { setMessage(error.localizedDescription, error: true) }
         updateLoginStatus()
-        escapeMonitor.onFailure = { [weak self] text in
-            guard let self else { return }
-            self.escCloseEnabled = false
-            UserDefaults.standard.set(false, forKey: "escCloseEnabled.v1")
-            self.setMessage(text, error: true)
-        }
-        escapeMonitor.onIssue = { [weak self] text in self?.setMessage(text, error: true) }
-        // Require opt-in after replacing the old non-exclusive ESC pipeline.
-        // Never auto-start a changed close strategy from a previous version's preference.
-        if UserDefaults.standard.integer(forKey: "escRoutingRevision.v1") != 4 {
-            UserDefaults.standard.set(false, forKey: "escCloseEnabled.v1")
-            UserDefaults.standard.set(4, forKey: "escRoutingRevision.v1")
-        }
-        if UserDefaults.standard.bool(forKey: "escCloseEnabled.v1") {
-            setEscapeClose(true)
-        }
+        // ESC remains in the source for future compatibility work, but this version
+        // has no monitor instance or global keyboard tap, even for existing users.
+        UserDefaults.standard.set(false, forKey: "escCloseEnabled.v1")
+        UserDefaults.standard.removeObject(forKey: "showAppDock.v1")
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             guard let self else { return }
             let newValue = AXIsProcessTrusted()
             if self.trusted != newValue { self.trusted = newValue }
-            if !newValue && self.escCloseEnabled {
-                self.setEscapeClose(false)
-                self.setMessage("辅助功能权限已撤销，ESC 关闭窗口已停用。", error: true)
-            }
         }
         observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             self?.endRecording()
         })
+        // Activation only requests a readback. It never invalidates a batch by itself.
+        for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didLaunchApplicationNotification,
+                     NSWorkspace.didTerminateApplicationNotification, NSWorkspace.didUnhideApplicationNotification] {
+            workspaceObservers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.checkRecovery()
+            })
+        }
+        recoveryTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            self?.checkRecovery()
+        }
+
     }
 
     func setMessage(_ value: String, error: Bool = false) {
         message = value; isError = error
-        escapeMonitor.setSuspended(isRecording || busy || barsBusy || showErrorAlert || error)
         if error && !isRecording { showErrorAlert = true }
         onStateChanged?()
     }
@@ -121,7 +121,6 @@ final class AppModel: ObservableObject {
         guard isRecording else { return }
         isRecording = false; recordingKind = nil
         hotKey?.isSuspended = false; barsHotKey?.isSuspended = false
-        updateEscapeSuspension()
         onStateChanged?()
     }
     func saveShortcut(_ value: Shortcut) -> Bool {
@@ -137,31 +136,6 @@ final class AppModel: ObservableObject {
         } catch { setMessage(error.localizedDescription, error: true); return false }
     }
     func invalidShortcut() { setMessage(ShortcutError.invalid.localizedDescription, error: true) }
-
-    func updateEscapeSuspension() {
-        escapeMonitor.setSuspended(isRecording || busy || barsBusy || showErrorAlert)
-    }
-    
-
-    func setEscapeClose(_ enabled: Bool) {
-        if !enabled {
-            escapeMonitor.stop()
-            escCloseEnabled = false
-            UserDefaults.standard.set(false, forKey: "escCloseEnabled.v1")
-            return
-        }
-        do {
-            try escapeMonitor.start()
-            escCloseEnabled = true
-            UserDefaults.standard.set(true, forKey: "escCloseEnabled.v1")
-            updateEscapeSuspension()
-        } catch {
-            escapeMonitor.stop()
-            escCloseEnabled = false
-            UserDefaults.standard.set(false, forKey: "escCloseEnabled.v1")
-            setMessage(error.localizedDescription, error: true)
-        }
-    }
 
     func saveBarsShortcut(_ value: Shortcut) -> Bool {
         guard let barsHotKey else { setMessage("系统栏快捷键服务未启动，请重新打开净桌。", error: true); return false }
@@ -192,14 +166,6 @@ final class AppModel: ObservableObject {
             if let data = try? JSONEncoder().encode(targets) { UserDefaults.standard.set(data, forKey: "barTargets.v1") }
             onStateChanged?()
         } catch { setMessage(error.localizedDescription, error: true) }
-    }
-
-    func setShowAppDock(_ enabled: Bool) {
-        guard NSApp.setActivationPolicy(enabled ? .regular : .accessory) else {
-            setMessage("程序坞图标显示设置未能修改，请重试。", error: true); return
-        }
-        showAppDock = enabled
-        UserDefaults.standard.set(enabled, forKey: "showAppDock.v1")
     }
 
     func toggleSystemBars() {
@@ -242,9 +208,98 @@ final class AppModel: ObservableObject {
 
     func toggleWindows() {
         guard !busy, !isRecording else { return }
-        switch lastBatch.nextAction {
-        case .minimize: minimizeAll()
-        case .restore: restoreWindows()
+        guard !lastBatch.windows.isEmpty else { minimizeAll(); return }
+        checkRecovery(followUp: .toggle)
+    }
+
+    private func recoveryTargets() -> [WindowTarget] {
+        let savedPIDs = Set(recoveryBaseline?.saved.map(\.pid) ?? [])
+        let applications = NSWorkspace.shared.runningApplications
+            .filter { ($0.activationPolicy == .regular || savedPIDs.contains($0.processIdentifier)) && !$0.isTerminated && $0.processIdentifier != getpid() }
+            .sorted { $0.processIdentifier < $1.processIdentifier }
+        guard !applications.isEmpty else { return [] }
+        let offset = recoveryTargetOffset % applications.count
+        recoveryTargetOffset = (offset + 1) % applications.count
+        let rotated = Array(applications[offset...]) + Array(applications[..<offset])
+        let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        // Newly opened foreground work is checked first; rotate the rest so a
+        // slow AX server cannot permanently starve later apps of observation.
+        let ordered = rotated.filter { $0.processIdentifier == frontPID }
+            + rotated.filter { $0.processIdentifier != frontPID && savedPIDs.contains($0.processIdentifier) }
+            + rotated.filter { $0.processIdentifier != frontPID && !savedPIDs.contains($0.processIdentifier) }
+        return ordered.map { WindowTarget(pid: $0.processIdentifier, name: $0.localizedName ?? "应用 \($0.processIdentifier)", isHidden: $0.isHidden) }
+    }
+
+    private func invalidateRecoveryCheck() {
+        recoveryGeneration += 1
+        recoveryCheckCancellation?.cancel()
+        recoveryCheckCancellation = nil
+        recoveryChecking = false
+        recoveryFollowUp = nil
+    }
+
+    private func checkRecovery(followUp: RecoveryFollowUp? = nil) {
+        guard !busy, !isRecording, !lastBatch.windows.isEmpty else { return }
+        guard AXIsProcessTrusted() else {
+            if followUp != nil { setMessage("请先在系统设置中允许净桌控制窗口。", error: true) }
+            return
+        }
+        if let followUp {
+            // A shortcut needs a new snapshot, not an observation begun before
+            // the user may have reopened a window.
+            if recoveryChecking { invalidateRecoveryCheck() }
+            recoveryFollowUp = followUp
+            busy = true
+            onStateChanged?()
+        }
+        guard !recoveryChecking else { return }
+        guard let baseline = recoveryBaseline else {
+            busy = false
+            let action = recoveryFollowUp; recoveryFollowUp = nil
+            if action != nil { performRestore() }
+            return
+        }
+        recoveryChecking = true
+        let generation = recoveryGeneration
+        let targets = recoveryTargets()
+        let criticalPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let cancel = CancellationFlag()
+        recoveryCheckCancellation = cancel
+        queue.async {
+            let result = RecoveryInspector(access: AXWindowAccess(messagingTimeout: 0.05)).inspect(baseline, targets: targets, criticalPID: criticalPID, cancelled: { cancel.cancelled })
+            DispatchQueue.main.async {
+                guard generation == self.recoveryGeneration, !cancel.cancelled else { return }
+                self.recoveryChecking = false
+                self.recoveryCheckCancellation = nil
+                self.recoveryBaseline = result.baseline
+                let own = self.lastBatch.windows.compactMap { item -> NSWindow? in
+                    if case .local(let window) = item, window.isMiniaturized { return window }
+                    return nil
+                }
+                if result.reset {
+                    self.lastBatch.replace(with: [])
+                    self.recoveryBaseline = nil
+                } else {
+                    self.lastBatch.replace(with: result.saved.map { .external($0) } + own.map { .local($0) })
+                    if self.lastBatch.windows.isEmpty { self.recoveryBaseline = nil }
+                }
+                self.updateRecoveryCount()
+                let action = self.recoveryFollowUp
+                self.recoveryFollowUp = nil
+                if action != nil { self.busy = false }
+                guard let action else { return }
+                switch action {
+                case .toggle:
+                    if self.lastBatch.windows.isEmpty { self.minimizeAll() }
+                    else if result.canRestore { self.performRestore() }
+                    else { self.setMessage("暂时无法确认当前窗口状态，恢复记录已保留，请稍后重试。", error: true) }
+                case .restore:
+                    if !self.lastBatch.windows.isEmpty {
+                        if result.canRestore { self.performRestore() }
+                        else { self.setMessage("暂时无法确认当前窗口状态，恢复记录已保留，请稍后重试。", error: true) }
+                    }
+                }
+            }
         }
     }
 
@@ -253,6 +308,8 @@ final class AppModel: ObservableObject {
         guard !isRecording else { return }
         trusted = AXIsProcessTrusted()
         guard trusted else { setMessage("请先在系统设置 → 隐私与安全性 → 辅助功能中允许“净桌”。", error: true); return }
+        invalidateRecoveryCheck()
+        recoveryBaseline = nil
         busy = true; details = []
         let mode = minimizeMode
         setMessage(mode == .sequential ? "正在顺序收起窗口…" : "正在批量收起窗口…")
@@ -264,7 +321,7 @@ final class AppModel: ObservableObject {
                 if rhs.processIdentifier == frontPID { return true }
                 return (lhs.localizedName ?? "") < (rhs.localizedName ?? "")
             }
-            .map { WindowTarget(pid: $0.processIdentifier, name: $0.localizedName ?? "应用 \($0.processIdentifier)") }
+            .map { WindowTarget(pid: $0.processIdentifier, name: $0.localizedName ?? "应用 \($0.processIdentifier)", isHidden: $0.isHidden) }
         let ownCandidates = NSApp.windows.filter {
             $0.isVisible && !$0.isMiniaturized && $0.styleMask.contains(.miniaturizable) && !$0.styleMask.contains(.fullScreen)
         }
@@ -282,13 +339,15 @@ final class AppModel: ObservableObject {
                     }
                 }
             })
+            let baseline = RecoveryInspector(access: AXWindowAccess(messagingTimeout: 0.05)).capture(saved: updated, targets: targets)
             DispatchQueue.main.async {
+                self.recoveryBaseline = baseline
                 self.details = report.details
                 var finalReport = report
                 // In simultaneous mode our window joins the burst; sequential mode handles it last.
                 let settle = ownIssued.isEmpty ? 0 : max(0, 0.7 - (ProcessInfo.processInfo.systemUptime - ownRequestedAt))
                 DispatchQueue.main.asyncAfter(deadline: .now() + settle) {
-                    var batch = updated.map { BatchWindow.external($0) }
+                    var batch = baseline.saved.map { BatchWindow.external($0) }
                     for window in ownIssued {
                         if window.isMiniaturized {
                             finalReport.succeeded += 1
@@ -310,8 +369,15 @@ final class AppModel: ObservableObject {
 
     func restoreWindows() {
         guard !busy, !isRecording, !lastBatch.windows.isEmpty else { return }
+        checkRecovery(followUp: .restore)
+    }
+
+    private func performRestore() {
+        guard !busy, !isRecording, !lastBatch.windows.isEmpty else { return }
         trusted = AXIsProcessTrusted()
         guard trusted else { setMessage("恢复其他应用窗口也需要“辅助功能”权限，请先授权。", error: true); return }
+        invalidateRecoveryCheck()
+        let targets = recoveryTargets()
         busy = true; details = []
         setMessage("正在恢复上次收起的那批窗口…")
         let saved = lastBatch.windows.compactMap { window -> EngineSaved<AXUIElement>? in
@@ -332,12 +398,14 @@ final class AppModel: ObservableObject {
                     for window in ownToRestore { window.deminiaturize(nil) }
                 }
             })
+            let baseline = RecoveryInspector(access: AXWindowAccess(messagingTimeout: 0.05)).capture(saved: pending, targets: targets)
             DispatchQueue.main.async {
+                self.recoveryBaseline = baseline
                 let settle = ownToRestore.isEmpty ? 0 : max(0, 0.7 - (ProcessInfo.processInfo.systemUptime - ownRequestedAt))
                 DispatchQueue.main.asyncAfter(deadline: .now() + settle) {
                     let restored = count + ownToRestore.filter { !$0.isMiniaturized }.count
                     let ownPending = ownSaved.filter { $0.isMiniaturized }
-                    self.lastBatch.finishRestore(pending: pending.map { .external($0) } + ownPending.map { .local($0) })
+                    self.lastBatch.finishRestore(pending: baseline.saved.map { .external($0) } + ownPending.map { .local($0) })
                     self.details = details
                     self.busy = false; self.cancellation = nil; self.updateRecoveryCount()
                     let remaining = self.lastBatch.windows.count
@@ -348,7 +416,13 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func cancelOperation() { cancellation?.cancel(); setMessage("正在停止，已完成的窗口仍可恢复…") }
+    func cancelOperation() {
+        cancellation?.cancel()
+        if recoveryFollowUp != nil {
+            invalidateRecoveryCheck(); busy = false
+        }
+        setMessage("正在停止，已完成的窗口仍可恢复…")
+    }
 
     private func updateRecoveryCount() {
         recoverableCount = lastBatch.windows.count
@@ -369,8 +443,11 @@ final class AppModel: ObservableObject {
     }
 
     func stop() {
-        escapeMonitor.stop()
+        invalidateRecoveryCheck()
+        recoveryTimer?.invalidate()
         cancellation?.cancel(); hotKey?.stop(); barsHotKey?.stop(); permissionTimer?.invalidate()
+        for observer in workspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        workspaceObservers.removeAll()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
         observers.removeAll()
     }

@@ -11,6 +11,7 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
 final class FakeWindow {
     var minimized = false
     var fullScreen = false
+    var role: String? = kAXWindowRole
     var subrole: String = kAXStandardWindowSubrole
     var writable = true
     var writeError: AXError = .success
@@ -42,7 +43,7 @@ final class FakeAccess: WindowAccess {
         if let pending = element.pending, time >= pending.0 { element.minimized = pending.1; element.pending = nil }
         return .success(attribute == "AXFullScreen" ? element.fullScreen : element.minimized)
     }
-    func string(_ element: FakeWindow, _ attribute: String) -> String? { element.subrole }
+    func string(_ element: FakeWindow, _ attribute: String) -> String? { attribute == kAXRoleAttribute ? element.role : element.subrole }
     func canWriteMinimized(_ element: FakeWindow) -> Bool { element.writable }
     func setMinimized(_ element: FakeWindow, _ minimized: Bool) -> AXError {
         operations.append(minimized ? "minimize" : "restore")
@@ -316,6 +317,200 @@ for mode in MinimizeMode.allCases {
     expect(MinimizeMode(rawValue: mode.rawValue) == mode, "mode raw value roundtrips for settings")
 }
 expect(MinimizeMode(rawValue: "unsupported") == nil, "invalid stored mode rejected")
+
+// Recovery state resets on real window changes, never app activation alone.
+func inspector(_ access: FakeAccess, budget: TimeInterval = 1.5) -> RecoveryInspector<FakeAccess> {
+    RecoveryInspector(access: access, now: { access.time }, globalBudget: budget)
+}
+do {
+    let access = FakeAccess(), first = FakeWindow(), second = FakeWindow()
+    access.applications[100] = [first, second]
+    let (_, saved) = engine(access).minimize([target()], cancelled: { false })
+    expect(saved.allSatisfy(\.confirmedMinimized), "successful minimize snapshots record confirmed baseline")
+    let baseline = inspector(access).capture(saved: saved, targets: [target()])
+    let unchanged = inspector(access).inspect(baseline, targets: [target()])
+    expect(!unchanged.reset && unchanged.saved.count == 2, "no window change preserves last batch without a timer")
+    first.minimized = false
+    let result = inspector(access).inspect(unchanged.baseline, targets: [target()])
+    expect(result.reset && result.saved.isEmpty, "manual expansion of one window invalidates entire previous batch")
+    expect(second.minimized && second.writes == [true], "forgetting recovery never expands or alters other windows")
+    let (_, next) = engine(access).minimize([target()], cancelled: { false })
+    expect(next.count == 1 && next[0].element === first, "next minimize only collects currently expanded windows")
+}
+do {
+    let access = FakeAccess(), first = FakeWindow(), oldVisible = FakeWindow()
+    oldVisible.writable = false; access.applications[100] = [first, oldVisible]
+    let (_, saved) = engine(access).minimize([target()], cancelled: { false })
+    let baseline = inspector(access).capture(saved: saved, targets: [target()])
+    expect(!inspector(access).inspect(baseline, targets: [target()]).reset, "unchanged unsupported visible window does not immediately reset")
+    let newWindow = FakeWindow(); access.applications[100]?.append(newWindow)
+    expect(inspector(access).inspect(baseline, targets: [target()]).reset, "new ordinary window in existing app resets recovery")
+}
+do {
+    let access = FakeAccess(), first = FakeWindow()
+    access.applications[100] = [first]
+    let (_, saved) = engine(access).minimize([target()], cancelled: { false })
+    let baseline = inspector(access).capture(saved: saved, targets: [target(), target(101)])
+    expect(!inspector(access).inspect(baseline, targets: [target(101), target()]).reset, "activation order alone does not reset")
+    expect(!inspector(access).inspect(baseline, targets: [target(), target(102)]).reset, "new process without ordinary window does not reset")
+    access.applications[102] = [FakeWindow()]
+    expect(inspector(access).inspect(baseline, targets: [target(), target(102)]).reset, "new process showing ordinary window resets")
+}
+do {
+    let access = FakeAccess(), first = FakeWindow(), image = FakeWindow(), content = FakeWindow(), full = FakeWindow()
+    image.subrole = "AXFloatingWindow"; content.role = kAXGroupRole; full.fullScreen = true
+    access.applications[100] = [first]
+    let (_, saved) = engine(access).minimize([target()], cancelled: { false })
+    let baseline = inspector(access).capture(saved: saved, targets: [target()])
+    access.applications[100]?.append(contentsOf: [image, content, full])
+    expect(!inspector(access).inspect(baseline, targets: [target()]).reset, "floating preview, internal content and fullscreen do not count as new ordinary window")
+}
+do {
+    let access = FakeAccess(), first = FakeWindow(), second = FakeWindow()
+    access.applications[100] = [first]; access.applications[101] = [second]
+    let (_, saved) = engine(access).minimize([target(), target(101)], cancelled: { false })
+    let baseline = inspector(access).capture(saved: saved, targets: [target(), target(101)])
+    access.applications[100] = []
+    let closed = inspector(access).inspect(baseline, targets: [target(), target(101)])
+    expect(!closed.reset && closed.saved.count == 1 && closed.saved[0].pid == 101, "closed window prunes only itself without resetting other saved windows")
+    let exited = inspector(access).inspect(baseline, targets: [target(101)])
+    expect(!exited.reset && exited.saved.count == 1 && exited.saved[0].pid == 101, "terminated app prunes only its snapshots")
+    let allGone = inspector(access).inspect(baseline, targets: [])
+    expect(!allGone.reset && allGone.saved.isEmpty, "all windows gone returns naturally to minimize")
+}
+do {
+    let access = FakeAccess(), first = FakeWindow()
+    access.applications[100] = [first]
+    let (_, saved) = engine(access).minimize([target()], cancelled: { false })
+    let baseline = inspector(access).capture(saved: saved, targets: [target()])
+    access.failures[100] = .cannotComplete
+    let unavailable = inspector(access).inspect(baseline, targets: [target()])
+    expect(!unavailable.reset && unavailable.saved.count == 1 && unavailable.incomplete, "failed app query preserves recovery rather than pretending app closed")
+    access.failures = [:]; first.readError = .cannotComplete
+    let stateUnavailable = inspector(access).inspect(baseline, targets: [target()])
+    expect(!stateUnavailable.reset && stateUnavailable.saved.count == 1, "failed minimized query does not pretend manual expansion")
+}
+do {
+    let access = FakeAccess(), first = FakeWindow(), unknown = FakeWindow()
+    access.applications[100] = [first];access.applications[101] = [unknown];access.failures[101] = .cannotComplete
+    let (_, saved) = engine(access).minimize([target()], cancelled: { false })
+    let baseline = inspector(access).capture(saved: saved, targets: [target(), target(101)])
+    access.failures = [:]
+    let readable = inspector(access).inspect(baseline, targets: [target(), target(101)])
+    expect(!readable.reset, "previously unreadable app establishes neutral first baseline rather than false new window")
+    access.applications[101]?.append(FakeWindow())
+    expect(inspector(access).inspect(readable.baseline, targets: [target(), target(101)]).reset, "new window after previously unknown app baseline is detectable")
+}
+do {
+    let access = FakeAccess(), first = FakeWindow(), uncertain = FakeWindow()
+    uncertain.applyWrite = false;access.applications[100] = [first, uncertain]
+    let (_, saved) = engine(access).minimize([target()], cancelled: { false })
+    expect(saved[0].confirmedMinimized && !saved[1].confirmedMinimized, "uncertain write is distinguishable from confirmed minimization")
+    let baseline = inspector(access).capture(saved: saved, targets: [target()])
+    let unchanged = inspector(access).inspect(baseline, targets: [target()])
+    expect(!unchanged.reset && unchanged.saved.count == 2, "never-minimized uncertain window cannot invalidate new batch")
+    uncertain.minimized = true
+    let settled = inspector(access).inspect(unchanged.baseline, targets: [target()])
+    expect(settled.saved.allSatisfy(\.confirmedMinimized), "later positive minimized readback promotes uncertain write")
+    uncertain.minimized = false
+    expect(inspector(access).inspect(settled.baseline, targets: [target()]).reset, "subsequent expansion of delayed minimize is detected")
+}
+do {
+    let access = FakeAccess(), first = FakeWindow(), unknown = FakeWindow()
+    access.applications[100] = [first, unknown]
+    let (_, saved) = engine(access).minimize([target()], cancelled: { false })
+    unknown.readError = .cannotComplete
+    let baseline = inspector(access).capture(saved: saved, targets: [target()])
+    unknown.readError = nil
+    let next = inspector(access).inspect(baseline, targets: [target()])
+    expect(!next.reset, "unknown initial window state becoming readable does not imply expansion")
+}
+do {
+    let access = FakeAccess(), first = FakeWindow();first.minimized = true
+    access.applications[100] = [first];access.queryCost = 2
+    let saved = [EngineSaved(pid: 100, application: "测试", element: first, confirmedMinimized: true)]
+    let result = inspector(access, budget: 0.2).inspect(RecoveryBaseline(knownPIDs: [100,101], saved: saved), targets: [target(), target(101)])
+    expect(result.incomplete && access.calls == [100] && result.saved.count == 1 && !result.reset, "observation budget bounds following queries and preserves recovery")
+    access.calls = []
+    let cancelled = inspector(access).inspect(result.baseline, targets: [target()], cancelled: { true })
+    expect(cancelled.incomplete && access.calls.isEmpty && cancelled.saved.count == 1, "cancelled observation performs no AX calls or destructive state transition")
+}
+
+do {
+    let access = FakeAccess(), first = FakeWindow(), hiddenWindow = FakeWindow()
+    first.minimized = true
+    access.applications[100] = [first];access.applications[101] = [hiddenWindow]
+    let saved = [EngineSaved(pid: 100, application: "测试", element: first, confirmedMinimized: true)]
+    let baseline = inspector(access).capture(saved: saved, targets: [target()])
+    let hiddenTarget = WindowTarget(pid: 101, name: "隐藏应用", isHidden: true)
+    let hidden = inspector(access).inspect(baseline, targets: [target(), hiddenTarget])
+    expect(!hidden.reset && hidden.saved.count == 1, "hidden app with AXMinimized false is not a visible new-window signal")
+    let visible = inspector(access).inspect(hidden.baseline, targets: [target(), target(101)])
+    expect(visible.reset, "explicit hidden-to-visible ordinary window transition resets recovery")
+}
+
+// Accepted delayed restore completion is our own operation, not user activity.
+do {
+    let access = FakeAccess(), delayed = FakeWindow(), failed = FakeWindow()
+    access.applications[100] = [delayed, failed]
+    let (_, saved) = engine(access).minimize([target()], cancelled: { false })
+    delayed.delay = 2; failed.applyWrite = false; failed.writeError = .notImplemented
+    let (_, pending, _) = engine(access).restore(saved, cancelled: { false })
+    expect(pending.count == 2 && pending.contains(where: { $0.element === delayed && $0.restoreRequested }), "pending accepted restore keeps its operation source")
+    expect(pending.contains(where: { $0.element === failed && !$0.restoreRequested }), "rejected restore is not falsely tagged as own expansion")
+    let baseline = inspector(access).capture(saved: pending, targets: [target()])
+    access.time += 2
+    let completed = inspector(access).inspect(baseline, targets: [target()])
+    expect(!completed.reset && completed.saved.count == 1 && completed.saved[0].element === failed, "delayed own restore completion only prunes its target, preserving other failed windows")
+    expect(completed.canRestore, "remaining known minimized target can still retry restoration")
+    expect(!inspector(access).inspect(completed.baseline, targets: [target()]).reset, "later polls do not rediscover our completed restore as manual work")
+    let newWindow = FakeWindow();access.applications[100]?.append(newWindow)
+    expect(inspector(access).inspect(completed.baseline, targets: [target()]).reset, "own delayed completion does not suppress other newly opened windows")
+}
+do {
+    let access = FakeAccess(), first = FakeWindow(), newWindow = FakeWindow()
+    access.applications[100] = [first]
+    let (_, saved) = engine(access).minimize([target()], cancelled: { false })
+    let baseline = inspector(access).capture(saved: saved, targets: [target()])
+    newWindow.readError = .cannotComplete;access.applications[101] = [newWindow]
+    let unknown = inspector(access).inspect(baseline, targets: [target(), target(101)], criticalPID: 101)
+    expect(!unknown.reset && !unknown.canRestore && unknown.baseline.pendingNewPIDs.contains(101), "new app attribute failure remains pending and blocks foreground restore decision")
+    newWindow.readError = nil
+    expect(inspector(access).inspect(unknown.baseline, targets: [target(), target(101)], criticalPID: 101).reset, "new app first readable visible window still invalidates batch after temporary failure")
+}
+do {
+    let access = FakeAccess(), first = FakeWindow(), newWindow = FakeWindow()
+    access.applications[100] = [first]
+    let (_, saved) = engine(access).minimize([target()], cancelled: { false })
+    let baseline = inspector(access).capture(saved: saved, targets: [target()])
+    newWindow.role = nil;access.applications[101] = [newWindow]
+    let unknown = inspector(access).inspect(baseline, targets: [target(), target(101)], criticalPID: 101)
+    expect(!unknown.canRestore && !unknown.reset, "unknown foreground role is not assumed to be a sheet or empty app")
+    newWindow.role = kAXWindowRole
+    expect(inspector(access).inspect(unknown.baseline, targets: [target(), target(101)], criticalPID: 101).reset, "new process origin survives temporary missing role")
+}
+do {
+    let access = FakeAccess(), first = FakeWindow()
+    access.applications[100] = [first]
+    let (_, saved) = engine(access).minimize([target()], cancelled: { false })
+    let baseline = inspector(access).capture(saved: saved, targets: [target(), target(101)])
+    access.failures[101] = .cannotComplete
+    let background = inspector(access).inspect(baseline, targets: [target(), target(101)], criticalPID: 100)
+    expect(background.canRestore && background.incomplete, "unrelated unavailable background app does not block restoration")
+    let foreground = inspector(access).inspect(baseline, targets: [target(), target(101)], criticalPID: 101)
+    expect(!foreground.canRestore && !foreground.reset && foreground.saved.count == 1, "unavailable foreground query blocks action but preserves recovery")
+    first.readError = .cannotComplete
+    expect(!inspector(access).inspect(baseline, targets: [target()]).canRestore, "unknown saved window state blocks stale restoration")
+}
+do {
+    let access = FakeAccess(), first = FakeWindow(), sheet = FakeWindow()
+    access.applications[100] = [first];sheet.subrole = kAXDialogSubrole;access.applications[101] = [sheet]
+    let (_, saved) = engine(access).minimize([target()], cancelled: { false })
+    let baseline = inspector(access).capture(saved: saved, targets: [target()])
+    expect(inspector(access).inspect(baseline, targets: [target(), target(101)], criticalPID: 101).canRestore, "legitimate foreground sheet without ordinary window does not block decision")
+    access.applications[101] = []
+    expect(inspector(access).inspect(baseline, targets: [target(), target(101)], criticalPID: 101).canRestore, "foreground app with positively empty window list is not unknown")
+}
 
 final class FakeBarAccess: SystemBarAccess {
     var state: BarState

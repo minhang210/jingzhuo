@@ -4,6 +4,7 @@ import ApplicationServices
 struct WindowTarget {
     let pid: pid_t
     let name: String
+    var isHidden = false
 }
 
 enum WindowToggleAction {
@@ -64,17 +65,19 @@ protocol WindowAccess {
 }
 
 struct AXWindowAccess: WindowAccess {
+    var messagingTimeout: Float = 0.4
     func windows(pid: pid_t) -> AccessResult<[AXUIElement]> {
         let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.4)
+        AXUIElementSetMessagingTimeout(app, messagingTimeout)
         var value: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
         guard error == .success else { return .failure(error) }
         guard let elements = value as? [AXUIElement] else { return .failure(.illegalArgument) }
-        for element in elements { AXUIElementSetMessagingTimeout(element, 0.4) }
+        for element in elements { AXUIElementSetMessagingTimeout(element, messagingTimeout) }
         return .success(elements)
     }
     func bool(_ element: AXUIElement, _ attribute: String) -> AccessResult<Bool> {
+        AXUIElementSetMessagingTimeout(element, messagingTimeout)
         var value: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
         guard error == .success else { return .failure(error) }
@@ -82,16 +85,19 @@ struct AXWindowAccess: WindowAccess {
         return .success(number.boolValue)
     }
     func string(_ element: AXUIElement, _ attribute: String) -> String? {
+        AXUIElementSetMessagingTimeout(element, messagingTimeout)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
         return value as? String
     }
     func canWriteMinimized(_ element: AXUIElement) -> Bool {
+        AXUIElementSetMessagingTimeout(element, messagingTimeout)
         var settable = DarwinBoolean(false)
         return AXUIElementIsAttributeSettable(element, kAXMinimizedAttribute as CFString, &settable) == .success && settable.boolValue
     }
     func setMinimized(_ element: AXUIElement, _ minimized: Bool) -> AXError {
-        AXUIElementSetAttributeValue(element, kAXMinimizedAttribute as CFString, minimized ? kCFBooleanTrue : kCFBooleanFalse)
+        AXUIElementSetMessagingTimeout(element, messagingTimeout)
+        return AXUIElementSetAttributeValue(element, kAXMinimizedAttribute as CFString, minimized ? kCFBooleanTrue : kCFBooleanFalse)
     }
     func same(_ lhs: AXUIElement, _ rhs: AXUIElement) -> Bool { CFEqual(lhs, rhs) }
 }
@@ -100,6 +106,198 @@ struct EngineSaved<Element> {
     let pid: pid_t
     let application: String
     let element: Element
+    // An accepted write can time out before confirmation. Such an intent is still
+    // recoverable, but cannot prove a later visible window was manually expanded.
+    var confirmedMinimized: Bool = false
+    // An accepted restore may finish after the shared verification timeout.
+    var restoreRequested = false
+}
+
+struct RecoveryApplication<Element> {
+    let pid: pid_t
+    let windows: [Element]
+    let visible: [Element]
+    let minimized: [Element]
+    var isHidden = false
+    var unknownStates: [Element] = []
+}
+
+struct RecoveryBaseline<Element> {
+    var applications: [RecoveryApplication<Element>] = []
+    // Includes unsuccessful/unqueried apps, so their first successful read does
+    // not look like a newly launched app or a new window.
+    var knownPIDs: Set<pid_t> = []
+    var saved: [EngineSaved<Element>] = []
+    var pendingNewPIDs: Set<pid_t> = []
+}
+
+struct RecoveryInspection<Element> {
+    let baseline: RecoveryBaseline<Element>
+    let reset: Bool
+    let incomplete: Bool
+    let criticalUnknown: Bool
+    var canRestore: Bool { !criticalUnknown }
+    var saved: [EngineSaved<Element>] { reset ? [] : baseline.saved }
+}
+
+// Read-only observation is intentionally separate from minimize/restore writes.
+// Call capture after a batch settles, then inspect while waiting and immediately
+// before a toggle. A query failure is unknown, never a user-expansion signal.
+struct RecoveryInspector<Access: WindowAccess> {
+    let access: Access
+    var now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    var globalBudget: TimeInterval = 1.5
+
+    private struct Observation {
+        var applications: [RecoveryApplication<Access.Element>] = []
+        var incomplete = false
+    }
+
+    private func observe(_ targets: [WindowTarget], cancelled: () -> Bool) -> Observation {
+        var result = Observation()
+        let deadline = now() + globalBudget
+        for target in targets {
+            guard !cancelled(), now() < deadline else { result.incomplete = true; break }
+            let windows: [Access.Element]
+            switch access.windows(pid: target.pid) {
+            case .success(let values): windows = values
+            case .failure: result.incomplete = true; continue
+            }
+            var visible: [Access.Element] = [], minimized: [Access.Element] = [], unknown: [Access.Element] = []
+            for (index, element) in windows.enumerated() {
+                guard !cancelled(), now() < deadline else {
+                    result.incomplete = true; unknown.append(contentsOf: windows[index...]); break
+                }
+                // A missing role is unknown, not evidence of an auxiliary layer.
+                guard let role = access.string(element, kAXRoleAttribute) else {
+                    result.incomplete = true; unknown.append(element); continue
+                }
+                guard role == kAXWindowRole else { continue }
+                guard let subrole = access.string(element, kAXSubroleAttribute) else {
+                    result.incomplete = true; unknown.append(element); continue
+                }
+                guard subrole == kAXStandardWindowSubrole else { continue }
+                switch access.bool(element, "AXFullScreen") {
+                case .success(true): continue
+                case .failure(let error) where error != .attributeUnsupported && error != .noValue:
+                    result.incomplete = true; unknown.append(element); continue
+                default: break
+                }
+                switch access.bool(element, kAXMinimizedAttribute) {
+                case .success(true): minimized.append(element)
+                case .success(false): if !target.isHidden { visible.append(element) }
+                case .failure: result.incomplete = true; unknown.append(element)
+                }
+            }
+            result.applications.append(RecoveryApplication(pid: target.pid, windows: windows,
+                visible: visible, minimized: minimized, isHidden: target.isHidden, unknownStates: unknown))
+        }
+        return result
+    }
+
+    func capture(saved: [EngineSaved<Access.Element>], targets: [WindowTarget],
+                 cancelled: () -> Bool = { false }) -> RecoveryBaseline<Access.Element> {
+        let observed = observe(targets, cancelled: cancelled)
+        var baseline = RecoveryBaseline(applications: observed.applications,
+                                        knownPIDs: Set(targets.map(\.pid)), saved: saved)
+        // Promote delayed writes only after positive minimized readback.
+        for index in baseline.saved.indices {
+            let item = baseline.saved[index]
+            if observed.applications.contains(where: { $0.pid == item.pid && $0.minimized.contains(where: { access.same($0, item.element) }) }) {
+                baseline.saved[index].confirmedMinimized = true
+            }
+        }
+        return baseline
+    }
+
+    func inspect(_ baseline: RecoveryBaseline<Access.Element>, targets: [WindowTarget],
+                 criticalPID: pid_t? = nil, cancelled: () -> Bool = { false }) -> RecoveryInspection<Access.Element> {
+        let observed = observe(targets, cancelled: cancelled)
+        let running = Set(targets.map(\.pid))
+        var updated = baseline
+        updated.pendingNewPIDs.formUnion(running.subtracting(baseline.knownPIDs))
+        updated.pendingNewPIDs.formIntersection(running)
+        var reset = false
+        var criticalUnknown = false
+        func ownRestore(_ pid: pid_t, _ window: Access.Element) -> Bool {
+            baseline.saved.contains { $0.pid == pid && $0.restoreRequested && access.same($0.element, window) }
+        }
+        // Only an absent process or a successful complete AXWindows list proves
+        // closure. Permission/timeouts preserve recovery intent for another try.
+        updated.saved.removeAll { item in
+            guard running.contains(item.pid) else { return true }
+            guard let app = observed.applications.first(where: { $0.pid == item.pid }) else { return false }
+            return !app.windows.contains(where: { access.same($0, item.element) }) ||
+                (item.restoreRequested && app.visible.contains(where: { access.same($0, item.element) }))
+        }
+        for index in updated.saved.indices {
+            let item = updated.saved[index]
+            guard let app = observed.applications.first(where: { $0.pid == item.pid }) else {
+                criticalUnknown = true; continue
+            }
+            if !app.minimized.contains(where: { access.same($0, item.element) }) &&
+                !app.visible.contains(where: { access.same($0, item.element) }) { criticalUnknown = true }
+            if !item.restoreRequested && item.confirmedMinimized && app.visible.contains(where: { access.same($0, item.element) }) { reset = true }
+            if app.minimized.contains(where: { access.same($0, item.element) }) {
+                updated.saved[index].confirmedMinimized = true
+            }
+        }
+        if let criticalPID, running.contains(criticalPID) {
+            if let app = observed.applications.first(where: { $0.pid == criticalPID }) {
+                if !app.unknownStates.isEmpty { criticalUnknown = true }
+            } else { criticalUnknown = true }
+        }
+        for app in observed.applications {
+            let manualVisible = app.visible.filter { !ownRestore(app.pid, $0) }
+            if updated.pendingNewPIDs.contains(app.pid) && !manualVisible.isEmpty { reset = true }
+            if let previous = baseline.applications.first(where: { $0.pid == app.pid }) {
+                if previous.isHidden && !app.isHidden && !manualVisible.isEmpty { reset = true }
+                for window in manualVisible {
+                    // An unchanged pre-existing visible window (e.g. unsupported
+                    // minimize) must not immediately invalidate the fresh batch.
+                    let wasVisible = previous.visible.contains(where: { access.same($0, window) })
+                    let wasMinimized = previous.minimized.contains(where: { access.same($0, window) })
+                    let existed = previous.windows.contains(where: { access.same($0, window) })
+                    if !wasVisible && (wasMinimized || !existed) { reset = true }
+                }
+            }
+            // Establish a baseline after previously unavailable apps become
+            // readable, rather than treating their old windows as newly opened.
+            if let index = updated.applications.firstIndex(where: { $0.pid == app.pid }) {
+                var previous = updated.applications[index]
+                // Once our late restore completes, its visible state becomes the
+                // neutral baseline too; the next poll must not rediscover it as manual.
+                let completedOwn = app.visible.filter { window in ownRestore(app.pid, window) &&
+                    !previous.visible.contains(where: { access.same($0, window) }) }
+                if !completedOwn.isEmpty {
+                    previous = RecoveryApplication(pid: app.pid, windows: previous.windows,
+                        visible: previous.visible + completedOwn, minimized: previous.minimized,
+                        isHidden: app.isHidden)
+                }
+                // Keep known visible windows plus newly readable unknown windows;
+                // retain minimized history to detect a later expansion.
+                for window in app.windows where !previous.windows.contains(where: { access.same($0, window) }) {
+                    previous = RecoveryApplication(pid: app.pid, windows: previous.windows + [window],
+                        visible: previous.visible + app.visible.filter { access.same($0, window) },
+                        minimized: previous.minimized + app.minimized.filter { access.same($0, window) }, isHidden: app.isHidden)
+                }
+                // Unknown state now readable needs a neutral initial baseline.
+                for window in app.visible + app.minimized where
+                    !previous.visible.contains(where: { access.same($0, window) }) &&
+                    !previous.minimized.contains(where: { access.same($0, window) }) {
+                    previous = RecoveryApplication(pid: app.pid, windows: previous.windows,
+                        visible: previous.visible + app.visible.filter { access.same($0, window) },
+                        minimized: previous.minimized + app.minimized.filter { access.same($0, window) }, isHidden: app.isHidden)
+                }
+                previous.isHidden = app.isHidden
+                updated.applications[index] = previous
+            } else { updated.applications.append(app) }
+        }
+        updated.knownPIDs.formUnion(observed.applications.map(\.pid))
+        if reset { updated.saved = [] }
+        return RecoveryInspection(baseline: updated, reset: reset, incomplete: observed.incomplete,
+                                  criticalUnknown: criticalUnknown)
+    }
 }
 
 // Kept separate from AppKit so timeout, exclusion and recovery behavior are testable.
@@ -202,7 +400,9 @@ struct WindowEngine<Access: WindowAccess> {
         for (index, request) in issued.enumerated() {
             if confirmed.contains(index) {
                 report.succeeded += 1
-                saved.append(request.snapshot)
+                var snapshot = request.snapshot
+                snapshot.confirmedMinimized = true
+                saved.append(snapshot)
             } else {
                 report.failed += 1
                 report.detail("\(request.snapshot.application)：未能确认窗口已最小化（\(request.result.rawValue)），可重试恢复。")
@@ -238,7 +438,9 @@ struct WindowEngine<Access: WindowAccess> {
                 pending.append(contentsOf: candidates[index...]); break
             }
             let result = access.setMinimized(candidate.element, false)
-            issued.append(Request(snapshot: candidate, result: result))
+            var requested = candidate
+            if result == .success || result == .cannotComplete { requested.restoreRequested = true }
+            issued.append(Request(snapshot: requested, result: result))
         }
         if !cancelled(), now() < deadline { onRequestsDispatched() }
         let confirmed = verify(issued, minimized: false, deadline: deadline, cancelled: cancelled)

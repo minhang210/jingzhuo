@@ -5,12 +5,13 @@
   <key>CFBundleIdentifier</key><string>local.jingzhuo.CleanDesk</string>
   <key>CFBundleName</key><string>净桌</string>
   <key>CFBundleDisplayName</key><string>净桌</string>
-  <key>CFBundleShortVersionString</key><string>0.6.6</string>
-  <key>CFBundleVersion</key><string>13</string>
+  <key>CFBundleShortVersionString</key><string>0.7.0</string>
+  <key>CFBundleVersion</key><string>14</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>AppIcon-v3</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+  <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSAppleEventsUsageDescription</key><string>净桌通过系统事件切换菜单栏与程序坞的自动隐藏设置，不操作其他应用内容。</string>
   <key>NSHumanReadableCopyright</key><string>净桌 · 本地桌面工具</string>

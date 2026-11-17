@@ -34,10 +34,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         NSApp.mainMenu = menu; NSApp.windowsMenu = windowMenu
 
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 458), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 366), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "净桌"; window.isReleasedWhenClosed = false
-        window.setContentSize(NSSize(width: 400, height: 458))
-        window.contentMinSize = NSSize(width: 294, height: 458)
+        window.setContentSize(NSSize(width: 400, height: 366))
+        window.contentMinSize = NSSize(width: 294, height: 352)
         window.delegate = self
         window.contentView = NSHostingView(rootView: SettingsView(model: model))
         window.center()
@@ -59,7 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem.menu = statusMenu
         model.onStateChanged = { [weak self] in self?.refreshMenu() }
         refreshMenu()
-        if !model.showAppDock { _ = NSApp.setActivationPolicy(.accessory) }
+        _ = NSApp.setActivationPolicy(.accessory)
         if !CommandLine.arguments.contains("--background") && !SMLoginItemStarted() { showSettings() }
     }
 
@@ -88,7 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func resetShortcut() { _ = model.saveShortcut(.standard) }
     @objc func quit() { NSApp.terminate(nil) }
     @objc func about() {
-        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "净桌", .applicationVersion: "0.6.6", .version: "13", .credits: NSAttributedString(string: "独立快捷键控制窗口与系统栏。\n可选 ESC 关闭当前普通窗口。")])
+        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "净桌", .applicationVersion: "0.7.0", .version: "14", .credits: NSAttributedString(string: "独立快捷键控制窗口与系统栏。\n手动打开窗口后，开始新一轮收起。")])
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showSettings(); return true }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -110,5 +110,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 let application = NSApplication.shared
 let delegate = AppDelegate()
 application.delegate = delegate
-application.setActivationPolicy(.regular)
+application.setActivationPolicy(.accessory)
 application.run()
