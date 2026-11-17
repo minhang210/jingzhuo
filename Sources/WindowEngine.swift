@@ -62,10 +62,41 @@ protocol WindowAccess {
     func canWriteMinimized(_ element: Element) -> Bool
     func setMinimized(_ element: Element, _ minimized: Bool) -> AXError
     func same(_ lhs: Element, _ rhs: Element) -> Bool
+    func isOnScreen(_ element: Element, pid: pid_t) -> AccessResult<Bool>
+}
+
+// Matching uses public geometry and ownership metadata only. Window names and
+// image pixels are never requested, so detection requires no screen capture access.
+struct OnScreenWindowGeometry {
+    let pid: pid_t
+    let layer: Int
+    let alpha: Double
+    let frame: CGRect
+    func matches(pid: pid_t, frame: CGRect) -> Bool {
+        self.pid == pid && layer == 0 && alpha > 0.01 && self.frame.width > 0 && self.frame.height > 0 &&
+        abs(self.frame.minX - frame.minX) <= 2 && abs(self.frame.minY - frame.minY) <= 2 &&
+        abs(self.frame.width - frame.width) <= 2 && abs(self.frame.height - frame.height) <= 2
+    }
 }
 
 struct AXWindowAccess: WindowAccess {
-    var messagingTimeout: Float = 0.4
+    var messagingTimeout: Float
+    private let onScreenWindows: [OnScreenWindowGeometry]?
+    init(messagingTimeout: Float = 0.4) {
+        self.messagingTimeout = messagingTimeout
+        // One CG snapshot per access instance / inspection, never one per window.
+        if let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+            onScreenWindows = rows.compactMap { row in
+                guard let owner = row[kCGWindowOwnerPID as String] as? NSNumber,
+                      let bounds = row[kCGWindowBounds as String] as? [String: Any],
+                      let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return nil }
+                return OnScreenWindowGeometry(pid: owner.int32Value,
+                    layer: (row[kCGWindowLayer as String] as? NSNumber)?.intValue ?? -1,
+                    alpha: (row[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1,
+                    frame: frame)
+            }
+        } else { onScreenWindows = nil }
+    }
     func windows(pid: pid_t) -> AccessResult<[AXUIElement]> {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, messagingTimeout)
@@ -100,6 +131,31 @@ struct AXWindowAccess: WindowAccess {
         return AXUIElementSetAttributeValue(element, kAXMinimizedAttribute as CFString, minimized ? kCFBooleanTrue : kCFBooleanFalse)
     }
     func same(_ lhs: AXUIElement, _ rhs: AXUIElement) -> Bool { CFEqual(lhs, rhs) }
+    func isOnScreen(_ element: AXUIElement, pid: pid_t) -> AccessResult<Bool> {
+        guard let rows = onScreenWindows else { return .failure(.cannotComplete) }
+        AXUIElementSetMessagingTimeout(element, messagingTimeout)
+        func attribute(_ key: String) -> AccessResult<AXValue> {
+            var value: CFTypeRef?
+            let error = AXUIElementCopyAttributeValue(element, key as CFString, &value)
+            guard error == .success else { return .failure(error) }
+            guard let value, CFGetTypeID(value) == AXValueGetTypeID() else { return .failure(.illegalArgument) }
+            return .success(unsafeBitCast(value, to: AXValue.self))
+        }
+        var position = CGPoint.zero, size = CGSize.zero
+        switch attribute(kAXPositionAttribute) {
+        case .success(let value):
+            guard AXValueGetValue(value, .cgPoint, &position) else { return .failure(.illegalArgument) }
+        case .failure(let error): return .failure(error)
+        }
+        switch attribute(kAXSizeAttribute) {
+        case .success(let value):
+            guard AXValueGetValue(value, .cgSize, &size) else { return .failure(.illegalArgument) }
+        case .failure(let error): return .failure(error)
+        }
+        // AX and CGWindow bounds both use global top-left coordinates.
+        let frame = CGRect(origin: position, size: size)
+        return .success(rows.contains { $0.matches(pid: pid, frame: frame) })
+    }
 }
 
 struct EngineSaved<Element> {
@@ -120,6 +176,7 @@ struct RecoveryApplication<Element> {
     let minimized: [Element]
     var isHidden = false
     var unknownStates: [Element] = []
+    var offscreen: [Element] = []
 }
 
 struct RecoveryBaseline<Element> {
@@ -129,14 +186,18 @@ struct RecoveryBaseline<Element> {
     var knownPIDs: Set<pid_t> = []
     var saved: [EngineSaved<Element>] = []
     var pendingNewPIDs: Set<pid_t> = []
+    // Accepted restores can leave `saved` as soon as AXMinimized becomes false,
+    // before their animation produces a matching on-screen CG window.
+    var ownRestores: [EngineSaved<Element>] = []
 }
 
 struct RecoveryInspection<Element> {
     let baseline: RecoveryBaseline<Element>
     let reset: Bool
     let incomplete: Bool
+    // Diagnostic only. Unknown information must never veto the whole batch:
+    // WindowEngine.restore rechecks each saved target and retains only failures.
     let criticalUnknown: Bool
-    var canRestore: Bool { !criticalUnknown }
     var saved: [EngineSaved<Element>] { reset ? [] : baseline.saved }
 }
 
@@ -163,7 +224,7 @@ struct RecoveryInspector<Access: WindowAccess> {
             case .success(let values): windows = values
             case .failure: result.incomplete = true; continue
             }
-            var visible: [Access.Element] = [], minimized: [Access.Element] = [], unknown: [Access.Element] = []
+            var visible: [Access.Element] = [], minimized: [Access.Element] = [], unknown: [Access.Element] = [], offscreen: [Access.Element] = []
             for (index, element) in windows.enumerated() {
                 guard !cancelled(), now() < deadline else {
                     result.incomplete = true; unknown.append(contentsOf: windows[index...]); break
@@ -185,21 +246,38 @@ struct RecoveryInspector<Access: WindowAccess> {
                 }
                 switch access.bool(element, kAXMinimizedAttribute) {
                 case .success(true): minimized.append(element)
-                case .success(false): if !target.isHidden { visible.append(element) }
+                case .success(false):
+                    if target.isHidden { offscreen.append(element); continue }
+                    // AXMinimized=false also describes internal/inactive windows
+                    // and windows on other Spaces. Require actual CG visibility.
+                    switch access.isOnScreen(element, pid: target.pid) {
+                    case .success(true): visible.append(element)
+                    case .success(false): offscreen.append(element)
+                    case .failure: result.incomplete = true; unknown.append(element)
+                    }
                 case .failure: result.incomplete = true; unknown.append(element)
                 }
             }
             result.applications.append(RecoveryApplication(pid: target.pid, windows: windows,
-                visible: visible, minimized: minimized, isHidden: target.isHidden, unknownStates: unknown))
+                visible: visible, minimized: minimized, isHidden: target.isHidden, unknownStates: unknown, offscreen: offscreen))
         }
         return result
     }
 
     func capture(saved: [EngineSaved<Access.Element>], targets: [WindowTarget],
+                 ownRestores: [EngineSaved<Access.Element>] = [],
                  cancelled: () -> Bool = { false }) -> RecoveryBaseline<Access.Element> {
         let observed = observe(targets, cancelled: cancelled)
         var baseline = RecoveryBaseline(applications: observed.applications,
                                         knownPIDs: Set(targets.map(\.pid)), saved: saved)
+        for item in ownRestores + saved.filter(\.restoreRequested) {
+            let visible = observed.applications.contains { app in
+                app.pid == item.pid && app.visible.contains { access.same($0, item.element) }
+            }
+            if !visible && !baseline.ownRestores.contains(where: { $0.pid == item.pid && access.same($0.element, item.element) }) {
+                baseline.ownRestores.append(item)
+            }
+        }
         // Promote delayed writes only after positive minimized readback.
         for index in baseline.saved.indices {
             let item = baseline.saved[index]
@@ -220,7 +298,8 @@ struct RecoveryInspector<Access: WindowAccess> {
         var reset = false
         var criticalUnknown = false
         func ownRestore(_ pid: pid_t, _ window: Access.Element) -> Bool {
-            baseline.saved.contains { $0.pid == pid && $0.restoreRequested && access.same($0.element, window) }
+            baseline.ownRestores.contains { $0.pid == pid && access.same($0.element, window) } ||
+                baseline.saved.contains { $0.pid == pid && $0.restoreRequested && access.same($0.element, window) }
         }
         // Only an absent process or a successful complete AXWindows list proves
         // closure. Permission/timeouts preserve recovery intent for another try.
@@ -257,8 +336,9 @@ struct RecoveryInspector<Access: WindowAccess> {
                     // minimize) must not immediately invalidate the fresh batch.
                     let wasVisible = previous.visible.contains(where: { access.same($0, window) })
                     let wasMinimized = previous.minimized.contains(where: { access.same($0, window) })
+                    let wasOffscreen = previous.offscreen.contains(where: { access.same($0, window) })
                     let existed = previous.windows.contains(where: { access.same($0, window) })
-                    if !wasVisible && (wasMinimized || !existed) { reset = true }
+                    if !wasVisible && (wasMinimized || wasOffscreen || !existed) { reset = true }
                 }
             }
             // Establish a baseline after previously unavailable apps become
@@ -272,29 +352,40 @@ struct RecoveryInspector<Access: WindowAccess> {
                 if !completedOwn.isEmpty {
                     previous = RecoveryApplication(pid: app.pid, windows: previous.windows,
                         visible: previous.visible + completedOwn, minimized: previous.minimized,
-                        isHidden: app.isHidden)
+                        isHidden: app.isHidden, offscreen: previous.offscreen)
                 }
                 // Keep known visible windows plus newly readable unknown windows;
                 // retain minimized history to detect a later expansion.
                 for window in app.windows where !previous.windows.contains(where: { access.same($0, window) }) {
                     previous = RecoveryApplication(pid: app.pid, windows: previous.windows + [window],
                         visible: previous.visible + app.visible.filter { access.same($0, window) },
-                        minimized: previous.minimized + app.minimized.filter { access.same($0, window) }, isHidden: app.isHidden)
+                        minimized: previous.minimized + app.minimized.filter { access.same($0, window) }, isHidden: app.isHidden,
+                        offscreen: previous.offscreen + app.offscreen.filter { access.same($0, window) })
                 }
                 // Unknown state now readable needs a neutral initial baseline.
-                for window in app.visible + app.minimized where
+                for window in app.visible + app.minimized + app.offscreen where
                     !previous.visible.contains(where: { access.same($0, window) }) &&
-                    !previous.minimized.contains(where: { access.same($0, window) }) {
+                    !previous.minimized.contains(where: { access.same($0, window) }) &&
+                    !previous.offscreen.contains(where: { access.same($0, window) }) {
                     previous = RecoveryApplication(pid: app.pid, windows: previous.windows,
                         visible: previous.visible + app.visible.filter { access.same($0, window) },
-                        minimized: previous.minimized + app.minimized.filter { access.same($0, window) }, isHidden: app.isHidden)
+                        minimized: previous.minimized + app.minimized.filter { access.same($0, window) }, isHidden: app.isHidden,
+                        offscreen: previous.offscreen + app.offscreen.filter { access.same($0, window) })
                 }
                 previous.isHidden = app.isHidden
                 updated.applications[index] = previous
             } else { updated.applications.append(app) }
         }
+        // Consume provenance only after its first on-screen readback (or known
+        // closure/exit). The neutral visible baseline above then prevents repeats.
+        updated.ownRestores.removeAll { item in
+            guard running.contains(item.pid) else { return true }
+            guard let app = observed.applications.first(where: { $0.pid == item.pid }) else { return false }
+            return !app.windows.contains(where: { access.same($0, item.element) }) ||
+                app.visible.contains(where: { access.same($0, item.element) })
+        }
         updated.knownPIDs.formUnion(observed.applications.map(\.pid))
-        if reset { updated.saved = [] }
+        if reset { updated.saved = []; updated.ownRestores = [] }
         return RecoveryInspection(baseline: updated, reset: reset, incomplete: observed.incomplete,
                                   criticalUnknown: criticalUnknown)
     }
@@ -415,7 +506,8 @@ struct WindowEngine<Access: WindowAccess> {
     }
 
     func restore(_ saved: [EngineSaved<Access.Element>], cancelled: () -> Bool,
-                 onRequestsDispatched: () -> Void = {}) -> (Int, [EngineSaved<Access.Element>], [String]) {
+                 onRequestsDispatched: () -> Void = {},
+                 onRestoreAccepted: (EngineSaved<Access.Element>) -> Void = { _ in }) -> (Int, [EngineSaved<Access.Element>], [String]) {
         var pending: [EngineSaved<Access.Element>] = []
         var details: [String] = []
         var candidates: [EngineSaved<Access.Element>] = []
@@ -439,7 +531,10 @@ struct WindowEngine<Access: WindowAccess> {
             }
             let result = access.setMinimized(candidate.element, false)
             var requested = candidate
-            if result == .success || result == .cannotComplete { requested.restoreRequested = true }
+            if result == .success || result == .cannotComplete {
+                requested.restoreRequested = true
+                onRestoreAccepted(requested)
+            }
             issued.append(Request(snapshot: requested, result: result))
         }
         if !cancelled(), now() < deadline { onRequestsDispatched() }

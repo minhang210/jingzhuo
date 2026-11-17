@@ -69,6 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func refreshMenu() {
         guard model != nil, minimizeItem != nil else { return }
+        statusItem.button?.toolTip = "净桌 · " + model.message
         minimizeItem.title = "\(model.nextAction == .restore ? "恢复上次窗口" : "收起所有窗口")    \(model.shortcut.display)"
         minimizeItem.isEnabled = !model.busy && !model.isRecording
         restoreItem.isEnabled = !model.busy && !model.isRecording && model.recoverableCount > 0
@@ -88,7 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func resetShortcut() { _ = model.saveShortcut(.standard) }
     @objc func quit() { NSApp.terminate(nil) }
     @objc func about() {
-        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "净桌", .applicationVersion: "0.7.0", .version: "14", .credits: NSAttributedString(string: "独立快捷键控制窗口与系统栏。\n手动打开窗口后，开始新一轮收起。")])
+        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "净桌", .applicationVersion: "0.7.1", .version: "15", .credits: NSAttributedString(string: "独立快捷键控制窗口与系统栏。\n手动打开窗口后，开始新一轮收起。")])
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showSettings(); return true }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

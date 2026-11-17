@@ -45,7 +45,7 @@ final class AppModel: ObservableObject {
     private var recoveryGeneration = 0
     private var recoveryChecking = false
     private var recoveryCheckCancellation: CancellationFlag?
-    private enum RecoveryFollowUp { case toggle, restore }
+    private enum RecoveryFollowUp { case toggle }
     private var recoveryFollowUp: RecoveryFollowUp?
     private var workspaceObservers: [NSObjectProtocol] = []
     private let queue = DispatchQueue(label: "local.jingzhuo.windows", qos: .userInitiated)
@@ -105,9 +105,9 @@ final class AppModel: ObservableObject {
 
     }
 
-    func setMessage(_ value: String, error: Bool = false) {
+    func setMessage(_ value: String, error: Bool = false, presentAlert: Bool = true) {
         message = value; isError = error
-        if error && !isRecording { showErrorAlert = true }
+        if error && presentAlert && !isRecording { showErrorAlert = true }
         onStateChanged?()
     }
 
@@ -208,6 +208,8 @@ final class AppModel: ObservableObject {
 
     func toggleWindows() {
         guard !busy, !isRecording else { return }
+        // A partial result is informational; it cannot capture the next shortcut.
+        showErrorAlert = false
         guard !lastBatch.windows.isEmpty else { minimizeAll(); return }
         checkRecovery(followUp: .toggle)
     }
@@ -266,7 +268,7 @@ final class AppModel: ObservableObject {
         let cancel = CancellationFlag()
         recoveryCheckCancellation = cancel
         queue.async {
-            let result = RecoveryInspector(access: AXWindowAccess(messagingTimeout: 0.05)).inspect(baseline, targets: targets, criticalPID: criticalPID, cancelled: { cancel.cancelled })
+            let result = RecoveryInspector(access: AXWindowAccess(messagingTimeout: followUp == nil ? 0.05 : 0.2)).inspect(baseline, targets: targets, criticalPID: criticalPID, cancelled: { cancel.cancelled })
             DispatchQueue.main.async {
                 guard generation == self.recoveryGeneration, !cancel.cancelled else { return }
                 self.recoveryChecking = false
@@ -291,13 +293,7 @@ final class AppModel: ObservableObject {
                 switch action {
                 case .toggle:
                     if self.lastBatch.windows.isEmpty { self.minimizeAll() }
-                    else if result.canRestore { self.performRestore() }
-                    else { self.setMessage("暂时无法确认当前窗口状态，恢复记录已保留，请稍后重试。", error: true) }
-                case .restore:
-                    if !self.lastBatch.windows.isEmpty {
-                        if result.canRestore { self.performRestore() }
-                        else { self.setMessage("暂时无法确认当前窗口状态，恢复记录已保留，请稍后重试。", error: true) }
-                    }
+                    else { self.performRestore() }
                 }
             }
         }
@@ -360,7 +356,7 @@ final class AppModel: ObservableObject {
                     self.busy = false; self.cancellation = nil
                     self.updateRecoveryCount()
                     let hint = batch.isEmpty ? "" : " 再按同一快捷键，仅恢复上次收起的窗口。"
-                    self.setMessage(finalReport.summary + hint, error: finalReport.failed > 0 || finalReport.interrupted)
+                    self.setMessage(finalReport.summary + hint, error: finalReport.failed > 0 || finalReport.interrupted, presentAlert: false)
                     self.onMinimized?()
                 }
             }
@@ -369,7 +365,10 @@ final class AppModel: ObservableObject {
 
     func restoreWindows() {
         guard !busy, !isRecording, !lastBatch.windows.isEmpty else { return }
-        checkRecovery(followUp: .restore)
+        // This explicit menu action restores only the saved batch, even while
+        // discovery of unrelated apps is slow or unavailable.
+        showErrorAlert = false
+        performRestore()
     }
 
     private func performRestore() {
@@ -378,6 +377,7 @@ final class AppModel: ObservableObject {
         guard trusted else { setMessage("恢复其他应用窗口也需要“辅助功能”权限，请先授权。", error: true); return }
         invalidateRecoveryCheck()
         let targets = recoveryTargets()
+        let previousOwnRestores = recoveryBaseline?.ownRestores ?? []
         busy = true; details = []
         setMessage("正在恢复上次收起的那批窗口…")
         let saved = lastBatch.windows.compactMap { window -> EngineSaved<AXUIElement>? in
@@ -389,6 +389,7 @@ final class AppModel: ObservableObject {
         let cancel = CancellationFlag(); cancellation = cancel
         queue.async {
             var ownToRestore: [NSWindow] = []
+            var acceptedRestores = previousOwnRestores
             var ownRequestedAt: TimeInterval = 0
             let (count, pending, details) = WindowEngine(access: AXWindowAccess()).restore(saved, cancelled: { cancel.cancelled }, onRequestsDispatched: {
                 DispatchQueue.main.sync {
@@ -397,8 +398,8 @@ final class AppModel: ObservableObject {
                     ownRequestedAt = ProcessInfo.processInfo.systemUptime
                     for window in ownToRestore { window.deminiaturize(nil) }
                 }
-            })
-            let baseline = RecoveryInspector(access: AXWindowAccess(messagingTimeout: 0.05)).capture(saved: pending, targets: targets)
+            }, onRestoreAccepted: { acceptedRestores.append($0) })
+            let baseline = RecoveryInspector(access: AXWindowAccess(messagingTimeout: 0.05)).capture(saved: pending, targets: targets, ownRestores: acceptedRestores)
             DispatchQueue.main.async {
                 self.recoveryBaseline = baseline
                 let settle = ownToRestore.isEmpty ? 0 : max(0, 0.7 - (ProcessInfo.processInfo.systemUptime - ownRequestedAt))
@@ -410,7 +411,7 @@ final class AppModel: ObservableObject {
                     self.busy = false; self.cancellation = nil; self.updateRecoveryCount()
                     let remaining = self.lastBatch.windows.count
                     let suffix = remaining == 0 ? "。下次按快捷键将开始新一轮收起。" : "，仍有 \(remaining) 个窗口待恢复，再按快捷键重试。"
-                    self.setMessage("已恢复上次的 \(restored) 个窗口" + suffix, error: remaining > 0)
+                    self.setMessage("已恢复上次的 \(restored) 个窗口" + suffix, error: remaining > 0, presentAlert: false)
                 }
             }
         }

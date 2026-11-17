@@ -82,7 +82,7 @@ struct SettingsView: View {
     @ObservedObject var model: AppModel
 
     private var version: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.7.0"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.7.1"
     }
 
     private func modeButton(_ mode: MinimizeMode) -> some View {

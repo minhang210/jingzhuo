@@ -5,8 +5,8 @@
   <key>CFBundleIdentifier</key><string>local.jingzhuo.CleanDesk</string>
   <key>CFBundleName</key><string>净桌</string>
   <key>CFBundleDisplayName</key><string>净桌</string>
-  <key>CFBundleShortVersionString</key><string>0.7.0</string>
-  <key>CFBundleVersion</key><string>14</string>
+  <key>CFBundleShortVersionString</key><string>0.7.1</string>
+  <key>CFBundleVersion</key><string>15</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>AppIcon-v3</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
